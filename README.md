@@ -1,10 +1,19 @@
 # technitium-docker-reconciler
 
 Auto-creates Technitium DNS A records for containers exposed via
-[caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy),
-so a new service only needs **one** declaration -- labels on its compose
-service -- to get both reverse-proxy routing and a matching DNS record.
-No separate `hosts.yml` entry required for anything running this way.
+[Traefik](https://traefik.io/traefik/)'s Docker provider, so a new
+service only needs **one** declaration -- labels on its compose service
+-- to get both reverse-proxy routing and a matching DNS record. No
+separate `hosts.yml` entry required for anything running this way.
+
+Originally built against
+[caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy)
+when the homelab still used Caddy; switched to parsing Traefik's
+`Host()` router-rule labels instead on 2026-09-24 when the whole
+homelab moved to Traefik (in `homelab-compose` and, later, in-cluster
+too). Only the label-parsing layer changed -- everything below it
+(Technitium reconciliation, tag-and-prune) is unchanged and
+engine/proxy-agnostic.
 
 Same tag-and-prune model as the `uptime-kuma-reconciler` in `homelab-k8s`:
 every record this tool creates is marked with a `comments` value of
@@ -17,9 +26,14 @@ Ansible role in `homelab2`, is never touched.
 
 1. Connects to a Docker-API-compatible socket (Docker or Podman) and lists
    running containers.
-2. Reads each container's `caddy` / `caddy_N` labels (caddy-docker-proxy's
-   site-block labels -- nested directive labels like `caddy.reverse_proxy`
-   are ignored) to build the desired set of hostnames.
+2. For each container carrying `traefik.enable=true` (matching Traefik's
+   own `exposedByDefault=false` semantics), reads every
+   `traefik.http.routers.<name>.rule` label and pulls all backtick-quoted
+   hostnames out of every `Host(...)` call in the rule -- handles multiple
+   hosts in one call (`Host(\`a\`,\`b\`)`), multiple Host() calls combined
+   with `&&`/`||`, and rules with other matchers mixed in
+   (`Host(\`x\`) && PathPrefix(\`/api\`)`) -- to build the desired set of
+   hostnames.
 3. Logs into Technitium's HTTP API and ensures an A record exists for each
    desired hostname, pointing at `TARGET_IP`.
 4. Deletes any record it previously created (matched by the `comments`
@@ -69,7 +83,7 @@ DOCKER_HOST=unix:///run/user/<uid>/podman/podman.sock
 
 One instance per Docker/Podman host you want covered (each needs its own
 `TARGET_IP`) -- e.g. one on `pi`, and another on `media` once/if it gets a
-caddy-docker-proxy + Podman setup of its own.
+Traefik + Podman setup of its own.
 
 ```
 podman run -d --name technitium-docker-reconciler \
@@ -91,6 +105,6 @@ in this homelab's secrets model.
 
 That Ansible role still owns everything declared in `group_vars/all/
 hosts.yml` -- `dns_records` and non-container `caddy_vhosts`. This tool
-only ever manages records for containers carrying caddy-docker-proxy
-labels; the two never compete because they're scoped to different record
-sets (marker-tagged vs. untagged).
+only ever manages records for containers carrying Traefik router labels;
+the two never compete because they're scoped to different record sets
+(marker-tagged vs. untagged).

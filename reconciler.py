@@ -3,11 +3,17 @@
 technitium-docker-reconciler
 
 Watches a Docker-API-compatible engine (Docker or Podman) for running
-containers carrying caddy-docker-proxy site labels (`caddy` or `caddy_N`),
-and reconciles a matching A record in Technitium DNS for each declared
-hostname -- so a service only needs to be declared once, as labels on its
-compose service, to get both reverse-proxy routing (via caddy-docker-proxy)
-and a DNS record (via this tool).
+containers carrying Traefik router labels (`traefik.http.routers.<name>.rule`
+with a `Host(...)` matcher), and reconciles a matching A record in
+Technitium DNS for each declared hostname -- so a service only needs to be
+declared once, as labels on its compose service, to get both reverse-proxy
+routing (via Traefik) and a DNS record (via this tool).
+
+Originally built against caddy-docker-proxy; switched to Traefik 2026-09-24
+when the whole homelab moved off Caddy. Only the label-parsing layer
+changed (this file's `hostnames_from_rule`/`desired_hostnames_from_docker`)
+-- the Technitium reconciliation logic below is engine-agnostic and
+untouched.
 
 Same tag-and-prune model as the homelab-k8s Uptime Kuma reconciler: every
 record this tool creates is marked with a `comments` value equal to
@@ -28,7 +34,6 @@ import re
 import sys
 import time
 import logging
-from urllib.parse import urlparse
 
 import requests
 import docker
@@ -53,10 +58,18 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 TECHNITIUM_BASE = f"http://{TECHNITIUM_HOST}:{TECHNITIUM_PORT}/api"
 
-# Matches only root caddy-docker-proxy site-block labels (`caddy`, `caddy_0`,
-# `caddy_1`, ...) -- never nested directive labels like `caddy.reverse_proxy`
-# or `caddy_0.reverse_proxy`.
-SITE_LABEL_RE = re.compile(r"^caddy(_\d+)?$")
+# Matches a Traefik router rule label, e.g.
+# `traefik.http.routers.radarr.rule` -- never anything else
+# (`traefik.http.routers.radarr.entrypoints`, `traefik.http.services...`,
+# `traefik.http.middlewares...`, etc).
+ROUTER_RULE_LABEL_RE = re.compile(r"^traefik\.http\.routers\.[^.]+\.rule$")
+
+# Traefik v3 rule syntax: `Host(`a.com`)`, multiple args in one call
+# (`Host(`a.com`,`b.com`)`, OR'd), and/or combined with && / || across
+# several Host() calls. This pulls every backtick-quoted hostname out of
+# every Host(...) call in the rule, regardless of how they're combined.
+HOST_CALL_RE = re.compile(r"Host\(([^)]*)\)")
+BACKTICK_ARG_RE = re.compile(r"`([^`]+)`")
 
 
 def technitium_login():
@@ -156,28 +169,28 @@ def delete_record(token, domain, zone, ip_address):
     log.info("deleted stale A record %s", domain)
 
 
-def extract_hostname(raw):
-    raw = raw.strip()
-    if not raw or raw.startswith(":") or raw == "localhost":
-        return None
-    candidate = raw if "//" in raw else f"//{raw}"
-    host = urlparse(candidate).hostname
-    if not host or "." not in host:
-        return None
-    return host
+def hostnames_from_rule(rule_value):
+    hosts = set()
+    for call in HOST_CALL_RE.finditer(rule_value):
+        for arg in BACKTICK_ARG_RE.finditer(call.group(1)):
+            host = arg.group(1).strip()
+            if host and "." in host:
+                hosts.add(host)
+    return hosts
 
 
 def desired_hostnames_from_docker(client):
     desired = set()
     for container in client.containers.list(filters={"status": "running"}):
         labels = container.labels or {}
+        # Matches Traefik's own exposedByDefault=false semantics -- a
+        # container's routers only count if it opted in.
+        if labels.get("traefik.enable", "").lower() != "true":
+            continue
         for key, value in labels.items():
-            if not SITE_LABEL_RE.match(key):
+            if not ROUTER_RULE_LABEL_RE.match(key):
                 continue
-            for piece in re.split(r"[,\s]+", value):
-                host = extract_hostname(piece)
-                if host:
-                    desired.add(host)
+            desired |= hostnames_from_rule(value)
     return desired
 
 
@@ -191,7 +204,7 @@ def zone_for(hostname):
 
 def reconcile_once(client):
     desired = desired_hostnames_from_docker(client)
-    log.info("desired hostnames from caddy-docker-proxy labels: %s", sorted(desired) or "(none)")
+    log.info("desired hostnames from Traefik router labels: %s", sorted(desired) or "(none)")
 
     token = technitium_login()
     try:
