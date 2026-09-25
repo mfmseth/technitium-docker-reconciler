@@ -1,6 +1,6 @@
 # Podman-first (Containerfile is podman build's native name for this file;
 # it's plain OCI build syntax, so `docker build` works against it too).
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 COPY requirements.txt .
