@@ -99,7 +99,6 @@ DOCKER_HOST=unix:///run/user/<uid>/podman/podman.sock
 | `TTL` | no | `3600` | |
 | `POLL_INTERVAL` | no | `60` (seconds) | ignored with `--once` |
 | `STATIC_RECORDS_FILE` | no | -- | path to a YAML list of static records (see above) |
-| `DRY_RUN` | no | `false` | log intended changes without making them |
 | `DRY_RUN` | no | `false` | logs intended changes, makes none |
 | `DOCKER_HOST` | no | docker-py default | set to a Podman socket to target Podman |
 
