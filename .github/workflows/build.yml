@@ -3,6 +3,7 @@ name: Build and push
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -26,6 +27,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # main -> :latest; a vX.Y.Z git tag -> :vX.Y.Z (what homelab-compose
+      # pins, so Renovate can propose bumps).
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/mfmseth/technitium-docker-reconciler
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern=v{{version}}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -37,6 +48,7 @@ jobs:
           # QEMU-emulated cross builds are cheap and reliable here.
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/mfmseth/technitium-docker-reconciler:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

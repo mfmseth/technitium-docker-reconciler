@@ -21,6 +21,14 @@ MANAGED_MARKER. On each pass it only ever adds/removes records carrying
 that exact marker -- anything created by hand through the Technitium UI is
 never touched, matched, or deleted.
 
+Static records: hostnames that aren't a Traefik route (a bare SSH box, an
+external CNAME, the zone's wildcard) can be declared in a YAML file named
+by STATIC_RECORDS_FILE, so every record lives in git rather than only the
+ones derived from labels. Each entry is `{name, type: A|CNAME, value,
+ttl?}`. Static records are managed exactly like label-derived ones
+(tagged, updated, pruned) and win over a label-derived record for the
+same name.
+
 Known limitation: record tagging depends on Technitium's `comments` field
 (added in relatively recent Technitium releases). If your server version
 doesn't return `comments` on `zones/records/get`, this tool will never be
@@ -37,6 +45,7 @@ import logging
 
 import requests
 import docker
+import yaml
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -55,6 +64,12 @@ DEFAULT_ZONE = os.environ.get("DEFAULT_ZONE", "mfmseth.com")
 TTL = int(os.environ.get("TTL", "3600"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+STATIC_RECORDS_FILE = os.environ.get("STATIC_RECORDS_FILE", "")
+
+MANAGED_TYPES = ("A", "CNAME")
+# Field in a record's rData that holds its value, and the matching
+# zones/records/{add,delete} form parameter, per record type.
+RDATA_FIELD = {"A": "ipAddress", "CNAME": "cname"}
 
 TECHNITIUM_BASE = f"http://{TECHNITIUM_HOST}:{TECHNITIUM_PORT}/api"
 
@@ -116,17 +131,17 @@ def get_managed_records(token, zone):
 
     managed = {}
     for record in data["response"].get("records", []):
-        if record.get("type") != "A":
+        if record.get("type") not in MANAGED_TYPES:
             continue
         if record.get("comments") != MANAGED_MARKER:
             continue
-        managed[record["name"]] = record
+        managed[(record["name"].lower(), record["type"])] = record
     return managed
 
 
-def add_record(token, domain, zone):
+def add_record(token, domain, zone, rtype, value, ttl):
     if DRY_RUN:
-        log.info("[dry-run] would add A record %s -> %s", domain, TARGET_IP)
+        log.info("[dry-run] would add %s record %s -> %s", rtype, domain, value)
         return
     resp = requests.post(
         f"{TECHNITIUM_BASE}/zones/records/add",
@@ -134,9 +149,9 @@ def add_record(token, domain, zone):
             "token": token,
             "domain": domain,
             "zone": zone,
-            "type": "A",
-            "ipAddress": TARGET_IP,
-            "ttl": TTL,
+            "type": rtype,
+            RDATA_FIELD[rtype]: value,
+            "ttl": ttl,
             "overwrite": "true",
             "comments": MANAGED_MARKER,
         },
@@ -144,13 +159,13 @@ def add_record(token, domain, zone):
     )
     data = resp.json()
     if data.get("status") != "ok":
-        raise RuntimeError(f"Failed to add record for {domain}: {data}")
-    log.info("added/updated A record %s -> %s", domain, TARGET_IP)
+        raise RuntimeError(f"Failed to add {rtype} record for {domain}: {data}")
+    log.info("added/updated %s record %s -> %s", rtype, domain, value)
 
 
-def delete_record(token, domain, zone, ip_address):
+def delete_record(token, domain, zone, rtype, value):
     if DRY_RUN:
-        log.info("[dry-run] would delete A record %s (%s)", domain, ip_address)
+        log.info("[dry-run] would delete %s record %s (%s)", rtype, domain, value)
         return
     resp = requests.post(
         f"{TECHNITIUM_BASE}/zones/records/delete",
@@ -158,15 +173,15 @@ def delete_record(token, domain, zone, ip_address):
             "token": token,
             "domain": domain,
             "zone": zone,
-            "type": "A",
-            "ipAddress": ip_address,
+            "type": rtype,
+            RDATA_FIELD[rtype]: value,
         },
         timeout=10,
     )
     data = resp.json()
     if data.get("status") != "ok":
-        raise RuntimeError(f"Failed to delete record for {domain}: {data}")
-    log.info("deleted stale A record %s", domain)
+        raise RuntimeError(f"Failed to delete {rtype} record for {domain}: {data}")
+    log.info("deleted stale %s record %s", rtype, domain)
 
 
 def hostnames_from_rule(rule_value):
@@ -202,27 +217,59 @@ def zone_for(hostname):
     return None
 
 
+def load_static_records(path):
+    """Read STATIC_RECORDS_FILE into {(name, type): (value, ttl)}."""
+    if not path:
+        return {}
+    with open(path) as f:
+        entries = yaml.safe_load(f) or []
+    records = {}
+    for entry in entries:
+        name = entry["name"].lower().rstrip(".")
+        rtype = entry["type"].upper()
+        if rtype not in MANAGED_TYPES:
+            raise ValueError(f"{name}: unsupported record type {rtype} (supported: {MANAGED_TYPES})")
+        records[(name, rtype)] = (str(entry["value"]).rstrip("."), int(entry.get("ttl", TTL)))
+    return records
+
+
+def desired_records(client):
+    """Label-derived A records merged with static records; static wins."""
+    desired = {(host.lower(), "A"): (TARGET_IP, TTL) for host in desired_hostnames_from_docker(client)}
+    static = load_static_records(STATIC_RECORDS_FILE)
+    static_names = {name for name, _ in static}
+    # A name can't hold a CNAME alongside anything else, so a static entry
+    # replaces every label-derived record for that name.
+    desired = {key: val for key, val in desired.items() if key[0] not in static_names}
+    desired.update(static)
+    return desired
+
+
 def reconcile_once(client):
-    desired = desired_hostnames_from_docker(client)
-    log.info("desired hostnames from Traefik router labels: %s", sorted(desired) or "(none)")
+    desired = desired_records(client)
+    log.info("desired records: %s", ", ".join(f"{n} {t} {v}" for (n, t), (v, _) in sorted(desired.items())) or "(none)")
 
     token = technitium_login()
     try:
         ensure_zone(token, DEFAULT_ZONE)
         managed = get_managed_records(token, DEFAULT_ZONE)
 
-        for host in desired:
-            zone = zone_for(host)
+        for (name, rtype), (value, ttl) in sorted(desired.items()):
+            zone = zone_for(name)
             if zone is None:
-                log.warning("skipping %s: not under managed zone %s", host, DEFAULT_ZONE)
+                log.warning("skipping %s: not under managed zone %s", name, DEFAULT_ZONE)
                 continue
-            existing = managed.get(host)
-            if existing is None or existing.get("rData", {}).get("ipAddress") != TARGET_IP:
-                add_record(token, host, zone)
+            existing = managed.get((name, rtype))
+            if (
+                existing is None
+                or existing.get("rData", {}).get(RDATA_FIELD[rtype], "").rstrip(".") != value
+                or existing.get("ttl") != ttl
+            ):
+                add_record(token, name, zone, rtype, value, ttl)
 
-        for host, record in managed.items():
-            if host not in desired:
-                delete_record(token, host, DEFAULT_ZONE, record["rData"]["ipAddress"])
+        for (name, rtype), record in managed.items():
+            if (name, rtype) not in desired:
+                delete_record(token, name, DEFAULT_ZONE, rtype, record["rData"][RDATA_FIELD[rtype]])
     finally:
         technitium_logout(token)
 

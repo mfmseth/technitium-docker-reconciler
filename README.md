@@ -41,6 +41,28 @@ Ansible role in `homelab2`, is never touched.
 5. Repeats on `POLL_INTERVAL` (default 60s), or runs once and exits with
    `--once` for use under an external timer instead.
 
+## Static records
+
+Hostnames that aren't a Traefik route -- a bare SSH box, a CNAME to an
+external service, the zone's `*` wildcard -- go in a YAML file named by
+`STATIC_RECORDS_FILE`, so every record lives in git:
+
+```yaml
+- name: jumphost.mfmseth.com
+  type: A
+  value: 10.0.0.50
+- name: home.mfmseth.com
+  type: CNAME
+  value: example.ui.nabu.casa
+  ttl: 300
+```
+
+Supported types: `A`, `CNAME`. `ttl` defaults to `TTL`. Static records are
+tagged, updated and pruned exactly like label-derived ones, and a static
+entry replaces any label-derived record for the same name. An existing
+untagged record of the same name and type is overwritten and becomes
+managed from then on.
+
 ## Known limitation
 
 Record tagging depends on Technitium's `comments` field, added in
@@ -76,6 +98,8 @@ DOCKER_HOST=unix:///run/user/<uid>/podman/podman.sock
 | `DEFAULT_ZONE` | no | `mfmseth.com` | |
 | `TTL` | no | `3600` | |
 | `POLL_INTERVAL` | no | `60` (seconds) | ignored with `--once` |
+| `STATIC_RECORDS_FILE` | no | -- | path to a YAML list of static records (see above) |
+| `DRY_RUN` | no | `false` | log intended changes without making them |
 | `DRY_RUN` | no | `false` | logs intended changes, makes none |
 | `DOCKER_HOST` | no | docker-py default | set to a Podman socket to target Podman |
 
